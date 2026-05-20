@@ -41,15 +41,22 @@ async def chunked_copy(job_id: str, src: str, dst: str, remove_src: bool = False
             "file": os.path.basename(src),
             "progress": 0,
             "speed": 0,
-            "status": "running"
+            "status": "running",
+            "cancel": False
         }
 
         start_time = time.time()
         copied = 0
+        is_cancelled = False
 
         # Run file I/O in threadpool to prevent blocking the async loop
         with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
             while True:
+                # Check for cancel signal
+                if jobs[job_id].get("cancel"):
+                    is_cancelled = True
+                    break
+
                 # Read/Write chunks
                 chunk = await asyncio.to_thread(fsrc.read, block_size)
                 if not chunk:
@@ -63,14 +70,24 @@ async def chunked_copy(job_id: str, src: str, dst: str, remove_src: bool = False
                 jobs[job_id]["progress"] = round((copied / file_size) * 100, 1) if file_size else 100
                 jobs[job_id]["speed"] = round(speed_mb, 2)
                 
-                # Yield control back to event loop so API can serve progress requests
+                # Yield control back to event loop
                 await asyncio.sleep(0.005)
+
+        if is_cancelled:
+            # Clean up the partially written destination file
+            if os.path.exists(dst):
+                os.remove(dst)
+            jobs[job_id]["status"] = "cancelled"
+            jobs[job_id]["progress"] = 0
+            jobs[job_id]["speed"] = 0
+            return
 
         if remove_src:
             os.remove(src)
 
         jobs[job_id]["status"] = "completed"
         jobs[job_id]["progress"] = 100
+        jobs[job_id]["speed"] = 0
         
     except Exception as e:
         jobs[job_id]["status"] = f"error: {str(e)}"
@@ -81,12 +98,10 @@ def read_root():
 
 @app.get("/api/list")
 def list_directory(path: str = "/"):
-    """Returns contents of a directory."""
     if not os.path.exists(path) or not os.path.isdir(path):
         return JSONResponse({"error": "Invalid path"}, status_code=400)
     
     items = []
-    # Always include parent dir if not root
     if path != "/":
         items.append({"name": "..", "is_dir": True, "path": os.path.dirname(path)})
         
@@ -96,7 +111,6 @@ def list_directory(path: str = "/"):
             "is_dir": entry.is_dir(),
             "path": entry.path
         })
-    # Sort: Directories first, then alphabetical
     items.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
     return {"path": path, "items": items}
 
@@ -109,12 +123,10 @@ async def api_copy(op: FileOp, background_tasks: BackgroundTasks):
 @app.post("/api/move")
 async def api_move(op: FileOp, background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
-    # Try instant rename first (same filesystem)
     try:
         os.rename(op.src, op.dst)
         jobs[job_id] = {"file": os.path.basename(op.src), "progress": 100, "speed": 0, "status": "completed"}
     except OSError:
-        # Cross-device link fallback (copy then delete)
         background_tasks.add_task(chunked_copy, job_id, op.src, op.dst, True)
     return {"job_id": job_id}
 
@@ -126,12 +138,18 @@ def api_rename(op: FileOp):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
+@app.post("/api/cancel/{job_id}")
+def cancel_job(job_id: str):
+    """Flags a running job to abort itself."""
+    if job_id in jobs and jobs[job_id]["status"] == "running":
+        jobs[job_id]["cancel"] = True
+        return {"status": "cancelling"}
+    return JSONResponse({"error": "Job not found or not running"}, status_code=400)
+
 @app.get("/api/jobs")
 def get_jobs():
-    """Returns active and completed jobs, cleans up completed ones."""
     current_jobs = dict(jobs)
-    # Cleanup completed jobs so they don't bloat memory
     for k, v in list(jobs.items()):
-        if v["status"] in ["completed", "error"]:
+        if v["status"] in ["completed", "error", "cancelled"]:
             del jobs[k]
     return current_jobs
