@@ -107,7 +107,7 @@
             const data = await res.json();
             
             state[pane].path = data.path;
-            state[pane].selected = []; // Clear selection on navigate
+            state[pane].selected = [];
             setCookie(`${pane}Path`, data.path);
             
             document.getElementById(`${pane}-path`).innerText = data.path;
@@ -128,7 +128,6 @@
                     ${sizeHtml}
                 `;
                 
-                // Toggle multi-select
                 el.onclick = (e) => {
                     const selArray = state[pane].selected;
                     const idx = selArray.findIndex(i => i.path === item.path);
@@ -193,7 +192,6 @@
                 return alert("Folder copy/move is not supported yet. Please deselect folders.");
             }
 
-            // Submit all selected items to the backend queue
             const promises = items.map(async (item) => {
                 const destPath = state[toPane].path === '/' ? `/${item.name}` : `${state[toPane].path}/${item.name}`;
                 
@@ -212,7 +210,6 @@
 
             await Promise.all(promises);
 
-            // Clear selections and refresh
             state[fromPane].selected = [];
             loadDir('left', state.left.path);
             loadDir('right', state.right.path);
@@ -245,6 +242,12 @@
                 
                 const displayProgress = job.status === 'queued' ? 'Wait...' : Number(job.progress).toFixed(1) + '%';
                 
+                // Construct the speed and ETA display string if data is available
+                let speedEtaStr = '';
+                if (job.status === 'running' && job.speed) {
+                    speedEtaStr = `${job.speed} | ETA: ${job.eta} | `;
+                }
+                
                 container.innerHTML += `
                     <div class="p-3 ${bg} rounded border border-gray-700">
                         <div class="flex justify-between items-center text-sm mb-2 gap-2">
@@ -252,7 +255,7 @@
                                 <span>${job.file}</span> <span class="text-xs text-gray-400">(${job.status})</span>
                             </div>
                             <div class="flex items-center gap-2 shrink-0">
-                                <span class="font-mono text-xs whitespace-nowrap">${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${displayProgress}</span>
+                                <span class="font-mono text-xs whitespace-nowrap">${speedEtaStr}${displayProgress}</span>
                                 ${(job.status === 'running' || job.status === 'queued') ? `
                                     <button onclick="cancelJob('${id}')" 
                                             class="text-red-400 hover:text-red-300 font-bold px-2 py-0.5 rounded bg-gray-900 hover:bg-gray-700 transition shrink-0 ml-1 shadow" 
