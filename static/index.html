@@ -6,27 +6,21 @@
     <title>BrambleSync</title>
     <script src="/static/tailwindcss.js"></script>
     <style>
-        /* Lock down the viewport to prevent iOS elastic bounce */
         html, body {
             height: 100%;
             height: 100dvh; 
             overscroll-behavior-y: none;
             overflow: hidden;
         }
-        
         .selected { background-color: #3b82f6 !important; color: white; }
-        
-        /* Hide scrollbar for horizontal scrolling text */
         .no-scrollbar::-webkit-scrollbar { display: none; }
         .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
-
-        /* Prevent pane scrolling from bubbling up to body */
         .scrollable-pane { overscroll-behavior-y: contain; }
     </style>
 </head>
 <body class="bg-gray-900 text-gray-100 flex flex-col p-4 font-sans">
 
-    <header class="mb-4 shrink-0">
+    <header class="mb-4 shrink-0 flex justify-between items-end">
         <h1 class="text-2xl font-bold text-blue-400">BrambleSync</h1>
     </header>
 
@@ -43,11 +37,31 @@
 
         <!-- Operations -->
         <div class="flex flex-wrap md:flex-col justify-center gap-2 p-2 bg-gray-800 rounded-lg shrink-0">
-            <button onclick="performOp('copy', 'left', 'right')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold shadow">Copy &rarr;</button>
-            <button onclick="performOp('copy', 'right', 'left')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold shadow">&larr; Copy</button>
+            <button onclick="performOp('copy', 'left', 'right')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold shadow flex items-center justify-center gap-1">
+                Copy 
+                <span class="md:hidden">&darr;</span>
+                <span class="hidden md:inline">&rarr;</span>
+            </button>
+            
+            <button onclick="performOp('copy', 'right', 'left')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold shadow flex items-center justify-center gap-1">
+                <span class="md:hidden">&uarr;</span>
+                <span class="hidden md:inline">&larr;</span>
+                Copy
+            </button>
+            
             <div class="w-full h-px md:h-px md:w-full bg-gray-600 my-1 hidden md:block"></div>
-            <button onclick="performOp('move', 'left', 'right')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold shadow">Move &rarr;</button>
-            <button onclick="performOp('move', 'right', 'left')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold shadow">&larr; Move</button>
+            
+            <button onclick="performOp('move', 'left', 'right')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold shadow flex items-center justify-center gap-1">
+                Move 
+                <span class="md:hidden">&darr;</span>
+                <span class="hidden md:inline">&rarr;</span>
+            </button>
+            
+            <button onclick="performOp('move', 'right', 'left')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold shadow flex items-center justify-center gap-1">
+                <span class="md:hidden">&uarr;</span>
+                <span class="hidden md:inline">&larr;</span>
+                Move
+            </button>
         </div>
 
         <!-- Right Pane -->
@@ -61,13 +75,13 @@
 
     </main>
 
-    <!-- Progress Dashboard (Now bound by a max-height so it doesn't push the page down) -->
+    <!-- Progress Dashboard -->
     <div id="jobs-container" class="mt-4 space-y-2 overflow-y-auto scrollable-pane shrink-0 max-h-40 no-scrollbar"></div>
 
     <script>
         let state = {
-            left: { path: getCookie('leftPath') || '/', selected: null },
-            right: { path: getCookie('rightPath') || '/', selected: null }
+            left: { path: getCookie('leftPath') || '/', selected: [] },
+            right: { path: getCookie('rightPath') || '/', selected: [] }
         };
 
         function setCookie(name, value) {
@@ -93,7 +107,7 @@
             const data = await res.json();
             
             state[pane].path = data.path;
-            state[pane].selected = null;
+            state[pane].selected = []; // Clear selection on navigate
             setCookie(`${pane}Path`, data.path);
             
             document.getElementById(`${pane}-path`).innerText = data.path;
@@ -114,10 +128,17 @@
                     ${sizeHtml}
                 `;
                 
+                // Toggle multi-select
                 el.onclick = (e) => {
-                    Array.from(container.children).forEach(c => c.classList.remove('selected'));
-                    el.classList.add('selected');
-                    state[pane].selected = item;
+                    const selArray = state[pane].selected;
+                    const idx = selArray.findIndex(i => i.path === item.path);
+                    if (idx > -1) {
+                        selArray.splice(idx, 1);
+                        el.classList.remove('selected');
+                    } else {
+                        selArray.push(item);
+                        el.classList.add('selected');
+                    }
                 };
 
                 el.ondblclick = () => {
@@ -165,22 +186,34 @@
         }
 
         async function performOp(action, fromPane, toPane) {
-            const item = state[fromPane].selected;
-            if (!item || item.is_dir) return alert("Select a file first.");
+            const items = state[fromPane].selected;
+            if (!items || items.length === 0) return alert("Select at least one file first.");
             
-            const destPath = state[toPane].path === '/' ? `/${item.name}` : `${state[toPane].path}/${item.name}`;
-            
-            const res = await fetch(`/api/${action}`, {
-                method: 'POST',
-                headers:{'Content-Type': 'application/json'},
-                body: JSON.stringify({ src: item.path, dst: destPath })
-            });
-
-            if (!res.ok) {
-                const data = await res.json();
-                alert("Operation failed: " + data.error);
+            if (items.some(i => i.is_dir)) {
+                return alert("Folder copy/move is not supported yet. Please deselect folders.");
             }
 
+            // Submit all selected items to the backend queue
+            const promises = items.map(async (item) => {
+                const destPath = state[toPane].path === '/' ? `/${item.name}` : `${state[toPane].path}/${item.name}`;
+                
+                const res = await fetch(`/api/${action}`, {
+                    method: 'POST',
+                    headers:{'Content-Type': 'application/json'},
+                    body: JSON.stringify({ src: item.path, dst: destPath })
+                });
+
+                if (!res.ok) {
+                    const data = await res.json();
+                    console.error(`Failed to queue ${item.name}: ${data.error}`);
+                    alert(`Failed to queue ${item.name}: ${data.error}`);
+                }
+            });
+
+            await Promise.all(promises);
+
+            // Clear selections and refresh
+            state[fromPane].selected = [];
             loadDir('left', state.left.path);
             loadDir('right', state.right.path);
         }
@@ -204,13 +237,13 @@
                 } else if (job.status === 'cancelled') {
                     bg = 'bg-orange-900';
                     barColor = 'bg-orange-500';
-                }
-
-                if (job.status === 'completed') {
+                } else if (job.status === 'queued') {
+                    barColor = 'bg-gray-500'; 
+                } else if (job.status === 'completed') {
                     barColor = 'bg-green-500';
                 }
                 
-                const displayProgress = Number(job.progress).toFixed(1);
+                const displayProgress = job.status === 'queued' ? 'Wait...' : Number(job.progress).toFixed(1) + '%';
                 
                 container.innerHTML += `
                     <div class="p-3 ${bg} rounded border border-gray-700">
@@ -219,8 +252,8 @@
                                 <span>${job.file}</span> <span class="text-xs text-gray-400">(${job.status})</span>
                             </div>
                             <div class="flex items-center gap-2 shrink-0">
-                                <span class="font-mono text-xs whitespace-nowrap">${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${displayProgress}%</span>
-                                ${job.status === 'running' ? `
+                                <span class="font-mono text-xs whitespace-nowrap">${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${displayProgress}</span>
+                                ${(job.status === 'running' || job.status === 'queued') ? `
                                     <button onclick="cancelJob('${id}')" 
                                             class="text-red-400 hover:text-red-300 font-bold px-2 py-0.5 rounded bg-gray-900 hover:bg-gray-700 transition shrink-0 ml-1 shadow" 
                                             title="Cancel Transfer">✕</button>
