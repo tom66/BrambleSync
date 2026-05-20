@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BrambleSync</title>
+    <script src="/static/tailwindcss.js"></script>
+    <style>
+        .selected { background-color: #3b82f6 !important; color: white; }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 h-screen flex flex-col p-4 font-sans">
+
+    <header class="mb-4">
+        <h1 class="text-2xl font-bold text-blue-400">BrambleSync</h1>
+    </header>
+
+    <!-- Main Dual Pane Layout -->
+    <main class="flex-1 flex flex-col md:flex-row gap-4 overflow-hidden">
+        
+        <!-- Left Pane -->
+        <div class="flex-1 flex flex-col bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+            <div class="p-2 bg-gray-700 text-sm font-mono truncate" id="left-path">/</div>
+            <div class="flex-1 overflow-y-auto p-2" id="left-pane"></div>
+        </div>
+
+        <!-- Operations (Middle on Desktop, Top/Bottom on Mobile) -->
+        <div class="flex md:flex-col justify-center gap-2 p-2 bg-gray-800 rounded-lg shrink-0">
+            <button onclick="performOp('copy', 'left', 'right')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">Copy &rarr;</button>
+            <button onclick="performOp('copy', 'right', 'left')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">&larr; Copy</button>
+            <div class="w-px h-full md:h-px md:w-full bg-gray-600 my-1"></div>
+            <button onclick="performOp('move', 'left', 'right')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">Move &rarr;</button>
+            <button onclick="performOp('move', 'right', 'left')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">&larr; Move</button>
+        </div>
+
+        <!-- Right Pane -->
+        <div class="flex-1 flex flex-col bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
+            <div class="p-2 bg-gray-700 text-sm font-mono truncate" id="right-path">/</div>
+            <div class="flex-1 overflow-y-auto p-2" id="right-pane"></div>
+        </div>
+
+    </main>
+
+    <!-- Progress Dashboard -->
+    <div id="jobs-container" class="mt-4 space-y-2"></div>
+
+    <script>
+        let state = {
+            left: { path: getCookie('leftPath') || '/', selected: null },
+            right: { path: getCookie('rightPath') || '/', selected: null }
+        };
+
+        // Cookie Helpers
+        function setCookie(name, value) {
+            document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=31536000`;
+        }
+        function getCookie(name) {
+            const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+            return match ? decodeURIComponent(match[2]) : null;
+        }
+
+        async function loadDir(pane, path) {
+            const res = await fetch(`/api/list?path=${encodeURIComponent(path)}`);
+            if (!res.ok) return;
+            const data = await res.json();
+            
+            state[pane].path = data.path;
+            state[pane].selected = null;
+            setCookie(`${pane}Path`, data.path);
+            
+            document.getElementById(`${pane}-path`).innerText = data.path;
+            const container = document.getElementById(`${pane}-pane`);
+            container.innerHTML = '';
+
+            data.items.forEach(item => {
+                const el = document.createElement('div');
+                el.className = 'p-2 hover:bg-gray-700 cursor-pointer rounded flex items-center gap-2 select-none';
+                el.innerHTML = `<span>${item.is_dir ? '📁' : '📄'}</span><span class="truncate">${item.name}</span>`;
+                
+                // Click to select
+                el.onclick = (e) => {
+                    Array.from(container.children).forEach(c => c.classList.remove('selected'));
+                    el.classList.add('selected');
+                    state[pane].selected = item;
+                };
+
+                // Double click to enter directory
+                el.ondblclick = () => {
+                    if (item.is_dir) loadDir(pane, item.path);
+                };
+
+                // Right click / long press to rename
+                el.oncontextmenu = async (e) => {
+                    e.preventDefault();
+                    const newName = prompt(`Rename ${item.name} to:`, item.name);
+                    if (newName && newName !== item.name) {
+                        const targetPath = data.path === '/' ? `/${newName}` : `${data.path}/${newName}`;
+                        await fetch('/api/rename', {
+                            method: 'POST',
+                            headers:{'Content-Type': 'application/json'},
+                            body: JSON.stringify({ src: item.path, dst: targetPath })
+                        });
+                        loadDir(pane, state[pane].path);
+                    }
+                };
+
+                container.appendChild(el);
+            });
+        }
+
+        async function performOp(action, fromPane, toPane) {
+            const item = state[fromPane].selected;
+            if (!item || item.is_dir) return alert("Select a file first.");
+            
+            const destPath = state[toPane].path === '/' ? `/${item.name}` : `${state[toPane].path}/${item.name}`;
+            
+            await fetch(`/api/${action}`, {
+                method: 'POST',
+                headers:{'Content-Type': 'application/json'},
+                body: JSON.stringify({ src: item.path, dst: destPath })
+            });
+
+            loadDir('left', state.left.path);
+            loadDir('right', state.right.path);
+        }
+
+        // Poll for active jobs
+        setInterval(async () => {
+            const res = await fetch('/api/jobs');
+            const jobs = await res.json();
+            const container = document.getElementById('jobs-container');
+            container.innerHTML = '';
+
+            Object.entries(jobs).forEach(([id, job]) => {
+                const bg = job.status === 'error' ? 'bg-red-900' : 'bg-gray-800';
+                const barColor = job.status === 'completed' ? 'bg-green-500' : 'bg-blue-500';
+                
+                container.innerHTML += `
+                    <div class="p-3 ${bg} rounded border border-gray-700">
+                        <div class="flex justify-between text-sm mb-1">
+                            <span>${job.file} (${job.status})</span>
+                            <span>${job.speed} MB/s | ${job.progress}%</span>
+                        </div>
+                        <div class="w-full bg-gray-900 rounded-full h-2.5">
+                            <div class="${barColor} h-2.5 rounded-full" style="width: ${job.progress}%"></div>
+                        </div>
+                    </div>
+                `;
+            });
+        }, 1000);
+
+        // Initial Load
+        loadDir('left', state.left.path);
+        loadDir('right', state.right.path);
+    </script>
+</body>
+</html>
