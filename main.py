@@ -3,17 +3,49 @@ import time
 import uuid
 import asyncio
 import math
-from fastapi import FastAPI, BackgroundTasks, Request
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
 # Global state
 jobs = {}
 active_files = set() # Tracks paths currently involved in operations
+job_queue = None
+
+async def worker_loop():
+    """Worker task that processes jobs from the queue."""
+    while True:
+        job_id = await job_queue.get()
+        job = jobs.get(job_id)
+        
+        if not job or job["status"] in ["cancelled", "error"]:
+            job_queue.task_done()
+            continue
+            
+        try:
+            job["status"] = "running"
+            await execute_job(job_id)
+        except Exception as e:
+            job["status"] = f"error: {str(e)}"
+        finally:
+            unlock(job["src"], job["dst"])
+            job_queue.task_done()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize queue and 3 worker tasks
+    global job_queue
+    job_queue = asyncio.Queue()
+    workers = [asyncio.create_task(worker_loop()) for _ in range(3)]
+    yield
+    # Shutdown: Clean up workers
+    for w in workers:
+        w.cancel()
+
+app = FastAPI(lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 class FileOp(BaseModel):
     src: str
@@ -23,7 +55,6 @@ class MkdirOp(BaseModel):
     path: str
 
 def check_and_lock(src: str, dst: str) -> bool:
-    """Check if files are busy, and lock them if not."""
     if src in active_files or dst in active_files:
         return False
     active_files.add(src)
@@ -31,7 +62,6 @@ def check_and_lock(src: str, dst: str) -> bool:
     return True
 
 def unlock(src: str, dst: str):
-    """Release the lock on files."""
     active_files.discard(src)
     active_files.discard(dst)
 
@@ -48,64 +78,58 @@ def get_optimal_block_size(file_size: int, path: str) -> int:
     else:
         return max(fs_block * 1024, 4 * 1024 * 1024)
 
-async def chunked_copy(job_id: str, src: str, dst: str, remove_src: bool = False):
-    try:
-        file_size = os.path.getsize(src)
-        block_size = get_optimal_block_size(file_size, src)
-        
-        jobs[job_id] = {
-            "file": os.path.basename(src),
-            "progress": 0.0,
-            "speed": 0,
-            "status": "running",
-            "cancel": False
-        }
-
-        start_time = time.time()
-        copied = 0
-        is_cancelled = False
-
-        with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
-            while True:
-                if jobs[job_id].get("cancel"):
-                    is_cancelled = True
-                    break
-
-                chunk = await asyncio.to_thread(fsrc.read, block_size)
-                if not chunk:
-                    break
-                await asyncio.to_thread(fdst.write, chunk)
-                
-                copied += len(chunk)
-                elapsed = time.time() - start_time
-                speed_mb = (copied / elapsed) / (1024 * 1024) if elapsed > 0 else 0
-                
-                # Calculate percent and round down to 0.1 resolution
-                raw_percent = (copied / file_size) * 100 if file_size else 100.0
-                jobs[job_id]["progress"] = math.floor(raw_percent * 10) / 10.0
-                jobs[job_id]["speed"] = round(speed_mb, 2)
-                
-                await asyncio.sleep(0.005)
-
-        if is_cancelled:
-            if os.path.exists(dst):
-                os.remove(dst)
-            jobs[job_id]["status"] = "cancelled"
-            jobs[job_id]["progress"] = 0.0
-            jobs[job_id]["speed"] = 0
+async def execute_job(job_id: str):
+    """Core logic to process a single copy/move job."""
+    job = jobs[job_id]
+    src, dst = job["src"], job["dst"]
+    
+    # Try instant rename for moves on the same filesystem
+    if job["type"] == "move":
+        try:
+            os.rename(src, dst)
+            job["status"] = "completed"
+            job["progress"] = 100.0
             return
+        except OSError:
+            job["remove_src"] = True # Fallback to chunked copy then delete
+            pass
 
-        if remove_src:
-            os.remove(src)
+    file_size = os.path.getsize(src)
+    block_size = get_optimal_block_size(file_size, src)
+    start_time = time.time()
+    copied = 0
 
-        jobs[job_id]["status"] = "completed"
-        jobs[job_id]["progress"] = 100.0
-        jobs[job_id]["speed"] = 0
-        
-    except Exception as e:
-        jobs[job_id]["status"] = f"error: {str(e)}"
-    finally:
-        unlock(src, dst)
+    with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
+        while True:
+            if job.get("cancel"):
+                if os.path.exists(dst):
+                    os.remove(dst)
+                job["status"] = "cancelled"
+                job["progress"] = 0.0
+                job["speed"] = 0
+                return
+
+            chunk = await asyncio.to_thread(fsrc.read, block_size)
+            if not chunk:
+                break
+            await asyncio.to_thread(fdst.write, chunk)
+            
+            copied += len(chunk)
+            elapsed = time.time() - start_time
+            speed_mb = (copied / elapsed) / (1024 * 1024) if elapsed > 0 else 0
+            
+            raw_percent = (copied / file_size) * 100 if file_size else 100.0
+            job["progress"] = math.floor(raw_percent * 10) / 10.0
+            job["speed"] = round(speed_mb, 2)
+            
+            await asyncio.sleep(0.005)
+
+    if job.get("remove_src"):
+        os.remove(src)
+
+    job["status"] = "completed"
+    job["progress"] = 100.0
+    job["speed"] = 0
 
 @app.get("/")
 def read_root():
@@ -139,26 +163,47 @@ def api_mkdir(op: MkdirOp):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.post("/api/copy")
-async def api_copy(op: FileOp, background_tasks: BackgroundTasks):
+async def api_copy(op: FileOp):
+    if op.src == op.dst:
+        return JSONResponse({"error": "Source and destination are the same"}, status_code=400)
     if not check_and_lock(op.src, op.dst):
         return JSONResponse({"error": "File is currently in use by another operation"}, status_code=409)
     
     job_id = str(uuid.uuid4())
-    background_tasks.add_task(chunked_copy, job_id, op.src, op.dst, False)
+    jobs[job_id] = {
+        "type": "copy",
+        "src": op.src,
+        "dst": op.dst,
+        "remove_src": False,
+        "file": os.path.basename(op.src),
+        "progress": 0.0,
+        "speed": 0,
+        "status": "queued",
+        "cancel": False
+    }
+    await job_queue.put(job_id)
     return {"job_id": job_id}
 
 @app.post("/api/move")
-async def api_move(op: FileOp, background_tasks: BackgroundTasks):
+async def api_move(op: FileOp):
+    if op.src == op.dst:
+        return JSONResponse({"error": "Source and destination are the same"}, status_code=400)
     if not check_and_lock(op.src, op.dst):
         return JSONResponse({"error": "File is currently in use by another operation"}, status_code=409)
     
     job_id = str(uuid.uuid4())
-    try:
-        os.rename(op.src, op.dst)
-        jobs[job_id] = {"file": os.path.basename(op.src), "progress": 100.0, "speed": 0, "status": "completed"}
-        unlock(op.src, op.dst) 
-    except OSError:
-        background_tasks.add_task(chunked_copy, job_id, op.src, op.dst, True)
+    jobs[job_id] = {
+        "type": "move",
+        "src": op.src,
+        "dst": op.dst,
+        "remove_src": False,
+        "file": os.path.basename(op.src),
+        "progress": 0.0,
+        "speed": 0,
+        "status": "queued",
+        "cancel": False
+    }
+    await job_queue.put(job_id)
     return {"job_id": job_id}
 
 @app.post("/api/rename")
@@ -173,10 +218,15 @@ def api_rename(op: FileOp):
 
 @app.post("/api/cancel/{job_id}")
 def cancel_job(job_id: str):
-    if job_id in jobs and jobs[job_id]["status"] == "running":
-        jobs[job_id]["cancel"] = True
-        return {"status": "cancelling"}
-    return JSONResponse({"error": "Job not found or not running"}, status_code=400)
+    if job_id in jobs:
+        if jobs[job_id]["status"] == "running":
+            jobs[job_id]["cancel"] = True
+            return {"status": "cancelling"}
+        elif jobs[job_id]["status"] == "queued":
+            jobs[job_id]["status"] = "cancelled"
+            unlock(jobs[job_id]["src"], jobs[job_id]["dst"])
+            return {"status": "cancelled"}
+    return JSONResponse({"error": "Job not found or not active"}, status_code=400)
 
 @app.get("/api/jobs")
 def get_jobs():
