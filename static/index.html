@@ -19,7 +19,10 @@
         
         <!-- Left Pane -->
         <div class="flex-1 flex flex-col bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
-            <div class="p-2 bg-gray-700 text-sm font-mono truncate" id="left-path">/</div>
+            <div class="p-2 bg-gray-700 flex justify-between items-center border-b border-gray-600">
+                <div class="text-sm font-mono truncate mr-2" id="left-path">/</div>
+                <button onclick="createFolder('left')" class="bg-green-600 hover:bg-green-500 text-white text-xs px-2 py-1 rounded font-bold shrink-0">+ Folder</button>
+            </div>
             <div class="flex-1 overflow-y-auto p-2" id="left-pane"></div>
         </div>
 
@@ -34,7 +37,10 @@
 
         <!-- Right Pane -->
         <div class="flex-1 flex flex-col bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
-            <div class="p-2 bg-gray-700 text-sm font-mono truncate" id="right-path">/</div>
+            <div class="p-2 bg-gray-700 flex justify-between items-center border-b border-gray-600">
+                <div class="text-sm font-mono truncate mr-2" id="right-path">/</div>
+                <button onclick="createFolder('right')" class="bg-green-600 hover:bg-green-500 text-white text-xs px-2 py-1 rounded font-bold shrink-0">+ Folder</button>
+            </div>
             <div class="flex-1 overflow-y-auto p-2" id="right-pane"></div>
         </div>
 
@@ -52,9 +58,18 @@
         function setCookie(name, value) {
             document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=31536000`;
         }
+        
         function getCookie(name) {
             const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
             return match ? decodeURIComponent(match[2]) : null;
+        }
+
+        function formatSize(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
         async function loadDir(pane, path) {
@@ -72,8 +87,17 @@
 
             data.items.forEach(item => {
                 const el = document.createElement('div');
-                el.className = 'p-2 hover:bg-gray-700 cursor-pointer rounded flex items-center gap-2 select-none';
-                el.innerHTML = `<span>${item.is_dir ? '📁' : '📄'}</span><span class="truncate">${item.name}</span>`;
+                el.className = 'p-2 hover:bg-gray-700 cursor-pointer rounded flex justify-between items-center select-none gap-2';
+                
+                const sizeHtml = item.is_dir ? '' : `<span class="text-xs text-gray-400 whitespace-nowrap shrink-0">${formatSize(item.size)}</span>`;
+                
+                el.innerHTML = `
+                    <div class="flex items-center gap-2 overflow-hidden">
+                        <span>${item.is_dir ? '📁' : '📄'}</span>
+                        <span class="truncate">${item.name}</span>
+                    </div>
+                    ${sizeHtml}
+                `;
                 
                 el.onclick = (e) => {
                     Array.from(container.children).forEach(c => c.classList.remove('selected'));
@@ -90,11 +114,15 @@
                     const newName = prompt(`Rename ${item.name} to:`, item.name);
                     if (newName && newName !== item.name) {
                         const targetPath = data.path === '/' ? `/${newName}` : `${data.path}/${newName}`;
-                        await fetch('/api/rename', {
+                        const res = await fetch('/api/rename', {
                             method: 'POST',
                             headers:{'Content-Type': 'application/json'},
                             body: JSON.stringify({ src: item.path, dst: targetPath })
                         });
+                        if (!res.ok) {
+                            const errData = await res.json();
+                            alert("Rename failed: " + errData.error);
+                        }
                         loadDir(pane, state[pane].path);
                     }
                 };
@@ -103,17 +131,40 @@
             });
         }
 
+        async function createFolder(pane) {
+            const folderName = prompt("Enter new folder name:");
+            if (!folderName) return;
+
+            const targetPath = state[pane].path === '/' ? `/${folderName}` : `${state[pane].path}/${folderName}`;
+            const res = await fetch('/api/mkdir', {
+                method: 'POST',
+                headers:{'Content-Type': 'application/json'},
+                body: JSON.stringify({ path: targetPath })
+            });
+
+            if (!res.ok) {
+                const data = await res.json();
+                alert("Failed to create folder: " + data.error);
+            }
+            loadDir(pane, state[pane].path);
+        }
+
         async function performOp(action, fromPane, toPane) {
             const item = state[fromPane].selected;
             if (!item || item.is_dir) return alert("Select a file first.");
             
             const destPath = state[toPane].path === '/' ? `/${item.name}` : `${state[toPane].path}/${item.name}`;
             
-            await fetch(`/api/${action}`, {
+            const res = await fetch(`/api/${action}`, {
                 method: 'POST',
                 headers:{'Content-Type': 'application/json'},
                 body: JSON.stringify({ src: item.path, dst: destPath })
             });
+
+            if (!res.ok) {
+                const data = await res.json();
+                alert("Operation failed: " + data.error);
+            }
 
             loadDir('left', state.left.path);
             loadDir('right', state.right.path);
@@ -121,7 +172,6 @@
 
         async function cancelJob(jobId) {
             await fetch(`/api/cancel/${jobId}`, { method: 'POST' });
-            // Let the regular polling loop naturally pick up the "cancelled" status next tick
         }
 
         setInterval(async () => {
@@ -145,12 +195,14 @@
                     barColor = 'bg-green-500';
                 }
                 
+                const displayProgress = Number(job.progress).toFixed(1);
+                
                 container.innerHTML += `
                     <div class="p-3 ${bg} rounded border border-gray-700">
                         <div class="flex justify-between items-center text-sm mb-1">
                             <span>${job.file} (${job.status})</span>
                             <div class="flex items-center gap-4">
-                                <span>${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${job.progress}%</span>
+                                <span class="font-mono">${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${displayProgress}%</span>
                                 ${job.status === 'running' ? `
                                     <button onclick="cancelJob('${id}')" 
                                             class="text-red-400 hover:text-red-300 font-bold px-2 py-0.5 rounded bg-gray-900 hover:bg-gray-700 transition" 
