@@ -3,6 +3,7 @@ import time
 import uuid
 import asyncio
 import math
+from collections import deque
 from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,21 +62,27 @@ async def execute_job(job_id: str):
     job = jobs[job_id]
     src, dst = job["src"], job["dst"]
     
-    # Try instant rename for moves on the same filesystem
     if job["type"] == "move":
         try:
             os.rename(src, dst)
             job["status"] = "completed"
             job["progress"] = 100.0
+            job["speed"] = ""
+            job["eta"] = ""
             return
         except OSError:
-            job["remove_src"] = True # Fallback to chunked copy then delete
+            job["remove_src"] = True 
             pass
 
     file_size = os.path.getsize(src)
     block_size = get_optimal_block_size(file_size, src)
+    
     start_time = time.time()
     copied = 0
+    
+    # Track performance over the last 30 seconds
+    history = deque([(start_time, 0)])
+    last_append_time = start_time
 
     with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
         while True:
@@ -84,7 +91,8 @@ async def execute_job(job_id: str):
                     os.remove(dst)
                 job["status"] = "cancelled"
                 job["progress"] = 0.0
-                job["speed"] = 0
+                job["speed"] = ""
+                job["eta"] = ""
                 return
 
             chunk = await asyncio.to_thread(fsrc.read, block_size)
@@ -93,12 +101,39 @@ async def execute_job(job_id: str):
             await asyncio.to_thread(fdst.write, chunk)
             
             copied += len(chunk)
-            elapsed = time.time() - start_time
-            speed_mb = (copied / elapsed) / (1024 * 1024) if elapsed > 0 else 0
+            now = time.time()
+            
+            # Record a snapshot every 0.5s
+            if now - last_append_time >= 0.5:
+                history.append((now, copied))
+                last_append_time = now
+                
+            # Discard snapshots older than 30 seconds
+            while history and history[0][0] < now - 30.0:
+                history.popleft()
+                
+            # Calculate rolling average
+            window_time = now - history[0][0]
+            window_bytes = copied - history[0][1]
+            bytes_per_sec = window_bytes / window_time if window_time > 0 else 0
+            
+            # Format Speed
+            if bytes_per_sec >= 1024 * 1024:
+                job["speed"] = f"{bytes_per_sec / (1024 * 1024):.2f} MiB/s"
+            else:
+                job["speed"] = f"{bytes_per_sec / 1024:.2f} KiB/s"
+                
+            # Format ETA
+            remaining_bytes = file_size - copied
+            if bytes_per_sec > 0:
+                eta_sec = int(remaining_bytes / bytes_per_sec)
+                m, s = divmod(eta_sec, 60)
+                job["eta"] = f"{m:02d}:{s:02d}"
+            else:
+                job["eta"] = "--:--"
             
             raw_percent = (copied / file_size) * 100 if file_size else 100.0
             job["progress"] = math.floor(raw_percent * 10) / 10.0
-            job["speed"] = round(speed_mb, 2)
             
             await asyncio.sleep(0.005)
 
@@ -107,7 +142,8 @@ async def execute_job(job_id: str):
 
     job["status"] = "completed"
     job["progress"] = 100.0
-    job["speed"] = 0
+    job["speed"] = ""
+    job["eta"] = ""
 
 async def process_job(job_id: str):
     """Waits for a slot, then executes the job."""
@@ -117,9 +153,7 @@ async def process_job(job_id: str):
         
     sem = get_semaphore()
     
-    # Wait in line for an available worker slot (concurrency limit = 3)
     async with sem:
-        # Re-check status in case user clicked Cancel while it was waiting in the queue
         if job["status"] == "cancelled":
             return
             
@@ -177,12 +211,12 @@ async def api_copy(op: FileOp, background_tasks: BackgroundTasks):
         "remove_src": False,
         "file": os.path.basename(op.src),
         "progress": 0.0,
-        "speed": 0,
+        "speed": "",
+        "eta": "",
         "status": "queued",
         "cancel": False
     }
     
-    # Fire and forget; the Semaphore inside process_job will orchestrate the queue naturally
     background_tasks.add_task(process_job, job_id)
     return {"job_id": job_id}
 
@@ -201,7 +235,8 @@ async def api_move(op: FileOp, background_tasks: BackgroundTasks):
         "remove_src": False,
         "file": os.path.basename(op.src),
         "progress": 0.0,
-        "speed": 0,
+        "speed": "",
+        "eta": "",
         "status": "queued",
         "cancel": False
     }
