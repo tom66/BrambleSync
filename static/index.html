@@ -6,48 +6,63 @@
     <title>BrambleSync</title>
     <script src="/static/tailwindcss.js"></script>
     <style>
+        /* Lock down the viewport to prevent iOS elastic bounce */
+        html, body {
+            height: 100%;
+            height: 100dvh; 
+            overscroll-behavior-y: none;
+            overflow: hidden;
+        }
+        
         .selected { background-color: #3b82f6 !important; color: white; }
+        
+        /* Hide scrollbar for horizontal scrolling text */
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* Prevent pane scrolling from bubbling up to body */
+        .scrollable-pane { overscroll-behavior-y: contain; }
     </style>
 </head>
-<body class="bg-gray-900 text-gray-100 h-screen flex flex-col p-4 font-sans">
+<body class="bg-gray-900 text-gray-100 flex flex-col p-4 font-sans">
 
-    <header class="mb-4">
+    <header class="mb-4 shrink-0">
         <h1 class="text-2xl font-bold text-blue-400">BrambleSync</h1>
     </header>
 
-    <main class="flex-1 flex flex-col md:flex-row gap-4 overflow-hidden">
+    <main class="flex-1 flex flex-col md:flex-row gap-4 overflow-hidden min-h-0">
         
         <!-- Left Pane -->
         <div class="flex-1 flex flex-col bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
-            <div class="p-2 bg-gray-700 flex justify-between items-center border-b border-gray-600">
-                <div class="text-sm font-mono truncate mr-2" id="left-path">/</div>
-                <button onclick="createFolder('left')" class="bg-green-600 hover:bg-green-500 text-white text-xs px-2 py-1 rounded font-bold shrink-0">+ Folder</button>
+            <div class="p-2 bg-gray-700 flex justify-between items-center border-b border-gray-600 shrink-0">
+                <div class="text-sm font-mono overflow-x-auto whitespace-nowrap no-scrollbar mr-2" id="left-path">/</div>
+                <button onclick="createFolder('left')" class="bg-green-600 hover:bg-green-500 text-white text-xs px-2 py-1 rounded font-bold shrink-0 shadow">+ Folder</button>
             </div>
-            <div class="flex-1 overflow-y-auto p-2" id="left-pane"></div>
+            <div class="flex-1 overflow-y-auto p-2 scrollable-pane" id="left-pane"></div>
         </div>
 
         <!-- Operations -->
-        <div class="flex md:flex-col justify-center gap-2 p-2 bg-gray-800 rounded-lg shrink-0">
-            <button onclick="performOp('copy', 'left', 'right')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">Copy &rarr;</button>
-            <button onclick="performOp('copy', 'right', 'left')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold">&larr; Copy</button>
-            <div class="w-px h-full md:h-px md:w-full bg-gray-600 my-1"></div>
-            <button onclick="performOp('move', 'left', 'right')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">Move &rarr;</button>
-            <button onclick="performOp('move', 'right', 'left')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold">&larr; Move</button>
+        <div class="flex flex-wrap md:flex-col justify-center gap-2 p-2 bg-gray-800 rounded-lg shrink-0">
+            <button onclick="performOp('copy', 'left', 'right')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold shadow">Copy &rarr;</button>
+            <button onclick="performOp('copy', 'right', 'left')" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-sm font-bold shadow">&larr; Copy</button>
+            <div class="w-full h-px md:h-px md:w-full bg-gray-600 my-1 hidden md:block"></div>
+            <button onclick="performOp('move', 'left', 'right')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold shadow">Move &rarr;</button>
+            <button onclick="performOp('move', 'right', 'left')" class="px-4 py-2 bg-purple-600 hover:bg-purple-500 rounded text-sm font-bold shadow">&larr; Move</button>
         </div>
 
         <!-- Right Pane -->
         <div class="flex-1 flex flex-col bg-gray-800 rounded-lg border border-gray-700 overflow-hidden">
-            <div class="p-2 bg-gray-700 flex justify-between items-center border-b border-gray-600">
-                <div class="text-sm font-mono truncate mr-2" id="right-path">/</div>
-                <button onclick="createFolder('right')" class="bg-green-600 hover:bg-green-500 text-white text-xs px-2 py-1 rounded font-bold shrink-0">+ Folder</button>
+            <div class="p-2 bg-gray-700 flex justify-between items-center border-b border-gray-600 shrink-0">
+                <div class="text-sm font-mono overflow-x-auto whitespace-nowrap no-scrollbar mr-2" id="right-path">/</div>
+                <button onclick="createFolder('right')" class="bg-green-600 hover:bg-green-500 text-white text-xs px-2 py-1 rounded font-bold shrink-0 shadow">+ Folder</button>
             </div>
-            <div class="flex-1 overflow-y-auto p-2" id="right-pane"></div>
+            <div class="flex-1 overflow-y-auto p-2 scrollable-pane" id="right-pane"></div>
         </div>
 
     </main>
 
-    <!-- Progress Dashboard -->
-    <div id="jobs-container" class="mt-4 space-y-2"></div>
+    <!-- Progress Dashboard (Now bound by a max-height so it doesn't push the page down) -->
+    <div id="jobs-container" class="mt-4 space-y-2 overflow-y-auto scrollable-pane shrink-0 max-h-40 no-scrollbar"></div>
 
     <script>
         let state = {
@@ -92,9 +107,9 @@
                 const sizeHtml = item.is_dir ? '' : `<span class="text-xs text-gray-400 whitespace-nowrap shrink-0">${formatSize(item.size)}</span>`;
                 
                 el.innerHTML = `
-                    <div class="flex items-center gap-2 overflow-hidden">
-                        <span>${item.is_dir ? '📁' : '📄'}</span>
-                        <span class="truncate">${item.name}</span>
+                    <div class="flex items-center gap-2 overflow-hidden flex-1 min-w-0">
+                        <span class="shrink-0">${item.is_dir ? '📁' : '📄'}</span>
+                        <span class="overflow-x-auto whitespace-nowrap no-scrollbar flex-1">${item.name}</span>
                     </div>
                     ${sizeHtml}
                 `;
@@ -199,18 +214,20 @@
                 
                 container.innerHTML += `
                     <div class="p-3 ${bg} rounded border border-gray-700">
-                        <div class="flex justify-between items-center text-sm mb-1">
-                            <span>${job.file} (${job.status})</span>
-                            <div class="flex items-center gap-4">
-                                <span class="font-mono">${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${displayProgress}%</span>
+                        <div class="flex justify-between items-center text-sm mb-2 gap-2">
+                            <div class="overflow-x-auto whitespace-nowrap no-scrollbar flex-1 min-w-0 pr-2">
+                                <span>${job.file}</span> <span class="text-xs text-gray-400">(${job.status})</span>
+                            </div>
+                            <div class="flex items-center gap-2 shrink-0">
+                                <span class="font-mono text-xs whitespace-nowrap">${job.speed > 0 ? job.speed + ' MB/s | ' : ''}${displayProgress}%</span>
                                 ${job.status === 'running' ? `
                                     <button onclick="cancelJob('${id}')" 
-                                            class="text-red-400 hover:text-red-300 font-bold px-2 py-0.5 rounded bg-gray-900 hover:bg-gray-700 transition" 
+                                            class="text-red-400 hover:text-red-300 font-bold px-2 py-0.5 rounded bg-gray-900 hover:bg-gray-700 transition shrink-0 ml-1 shadow" 
                                             title="Cancel Transfer">✕</button>
                                 ` : ''}
                             </div>
                         </div>
-                        <div class="w-full bg-gray-900 rounded-full h-2.5">
+                        <div class="w-full bg-gray-900 rounded-full h-2.5 shadow-inner">
                             <div class="${barColor} h-2.5 rounded-full" style="width: ${job.progress}%"></div>
                         </div>
                     </div>
