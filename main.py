@@ -3,49 +3,20 @@ import time
 import uuid
 import asyncio
 import math
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Global state
 jobs = {}
 active_files = set() # Tracks paths currently involved in operations
-job_queue = None
 
-async def worker_loop():
-    """Worker task that processes jobs from the queue."""
-    while True:
-        job_id = await job_queue.get()
-        job = jobs.get(job_id)
-        
-        if not job or job["status"] in ["cancelled", "error"]:
-            job_queue.task_done()
-            continue
-            
-        try:
-            job["status"] = "running"
-            await execute_job(job_id)
-        except Exception as e:
-            job["status"] = f"error: {str(e)}"
-        finally:
-            unlock(job["src"], job["dst"])
-            job_queue.task_done()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: Initialize queue and 3 worker tasks
-    global job_queue
-    job_queue = asyncio.Queue()
-    workers = [asyncio.create_task(worker_loop()) for _ in range(3)]
-    yield
-    # Shutdown: Clean up workers
-    for w in workers:
-        w.cancel()
-
-app = FastAPI(lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Semaphore to limit concurrent operations to 3
+concurrency_limit = None 
 
 class FileOp(BaseModel):
     src: str
@@ -78,8 +49,15 @@ def get_optimal_block_size(file_size: int, path: str) -> int:
     else:
         return max(fs_block * 1024, 4 * 1024 * 1024)
 
+def get_semaphore():
+    """Lazily initialize the semaphore to ensure it attaches to the active event loop."""
+    global concurrency_limit
+    if concurrency_limit is None:
+        concurrency_limit = asyncio.Semaphore(3)
+    return concurrency_limit
+
 async def execute_job(job_id: str):
-    """Core logic to process a single copy/move job."""
+    """The actual heavy lifting for I/O operations."""
     job = jobs[job_id]
     src, dst = job["src"], job["dst"]
     
@@ -131,6 +109,28 @@ async def execute_job(job_id: str):
     job["progress"] = 100.0
     job["speed"] = 0
 
+async def process_job(job_id: str):
+    """Waits for a slot, then executes the job."""
+    job = jobs.get(job_id)
+    if not job or job["status"] in ["cancelled", "error"]:
+        return
+        
+    sem = get_semaphore()
+    
+    # Wait in line for an available worker slot (concurrency limit = 3)
+    async with sem:
+        # Re-check status in case user clicked Cancel while it was waiting in the queue
+        if job["status"] == "cancelled":
+            return
+            
+        job["status"] = "running"
+        try:
+            await execute_job(job_id)
+        except Exception as e:
+            job["status"] = f"error: {str(e)}"
+        finally:
+            unlock(job["src"], job["dst"])
+
 @app.get("/")
 def read_root():
     return FileResponse("static/index.html")
@@ -163,7 +163,7 @@ def api_mkdir(op: MkdirOp):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 @app.post("/api/copy")
-async def api_copy(op: FileOp):
+async def api_copy(op: FileOp, background_tasks: BackgroundTasks):
     if op.src == op.dst:
         return JSONResponse({"error": "Source and destination are the same"}, status_code=400)
     if not check_and_lock(op.src, op.dst):
@@ -181,11 +181,13 @@ async def api_copy(op: FileOp):
         "status": "queued",
         "cancel": False
     }
-    await job_queue.put(job_id)
+    
+    # Fire and forget; the Semaphore inside process_job will orchestrate the queue naturally
+    background_tasks.add_task(process_job, job_id)
     return {"job_id": job_id}
 
 @app.post("/api/move")
-async def api_move(op: FileOp):
+async def api_move(op: FileOp, background_tasks: BackgroundTasks):
     if op.src == op.dst:
         return JSONResponse({"error": "Source and destination are the same"}, status_code=400)
     if not check_and_lock(op.src, op.dst):
@@ -203,7 +205,8 @@ async def api_move(op: FileOp):
         "status": "queued",
         "cancel": False
     }
-    await job_queue.put(job_id)
+    
+    background_tasks.add_task(process_job, job_id)
     return {"job_id": job_id}
 
 @app.post("/api/rename")
